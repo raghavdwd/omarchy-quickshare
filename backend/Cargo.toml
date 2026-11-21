@@ -1,0 +1,15 @@
+[package]
+name = "quickshare-rx"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rqs_lib = { path = "../oqs-core" }
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

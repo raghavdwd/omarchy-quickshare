@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""JSON-lines bridge between the Omarchy Quick Share plugin and a backend.
+
+Two backends are supported:
+
+  * quickshare-rx - preferred; BLE GATT/L2CAP receiver with explicit consent.
+  * nearcast      - BLE + Wi-Fi LAN + Wi-Fi Direct (limited frontend support).
+  * quickshare    - JaxonWright CLI, Wi-Fi LAN / mDNS only.
+
+Set QUICKSHARE_BACKEND=nearcast|quickshare to override auto-detection.
+"""
+
+import ctypes
+import hashlib
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+SOCKET_DIR = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "quickshare-omarchy"
+)
+SOCKET_PATH = os.path.join(SOCKET_DIR, "bridge.sock")
+NEARCAST_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "nearcast.sock"
+)
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+    "quickshare",
+)
+HISTORY_PATH = os.path.join(STATE_DIR, "history.json")
+ASK_TIMEOUT = 60
+HERE = os.path.dirname(os.path.realpath(__file__))
+ASK_SCRIPT = os.path.join(HERE, "quickshare-ask")
+
+_pending = {}
+_lock = threading.Lock()
+_backend = None
+_backend_path = None
+_backend_stdin = None
+
+
+def emit(obj):
+    line = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+    # Keep a local trail so connection failures can be diagnosed after the
+    # fact; events are also delivered to the QML panel over stdout.
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(os.path.join(STATE_DIR, "bridge.log"), "a", encoding="utf-8") as log:
+            log.write(time.strftime("%H:%M:%S") + " " + line + "\n")
+    except Exception:
+        pass
+
+
+def find_backend():
+    global _backend, _backend_path
+    forced = os.environ.get("QUICKSHARE_BACKEND", "").strip()
+    candidates = (
+        [forced]
+        if forced
+        else ["quickshare-rx", "nearcastd", "quickshare", "nearcast", "quickshare-daemon"]
+    )
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            _backend, _backend_path = name, path
+            return name, path
+    _backend, _backend_path = None, None
+    return None, None
+
+
+def append_history(msg):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        history = []
+        if os.path.exists(HISTORY_PATH):
+            with open(HISTORY_PATH, "r", encoding="utf-8") as handle:
+                history = json.load(handle)
+                if not isinstance(history, list):
+                    history = []
+        history.insert(
+            0,
+            {
+                "at": int(time.time()),
+                "from": msg.get("from", ""),
+                "files": msg.get("files", []),
+                "dir": msg.get("dir", ""),
+            },
+        )
+        with open(HISTORY_PATH, "w", encoding="utf-8") as handle:
+            json.dump(history[:100], handle, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        emit({"t": "error", "message": "history: " + str(exc)})
+
+
+def ctl_message(payload, timeout=ASK_TIMEOUT + 5):
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(SOCKET_PATH)
+        sock.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        stream = sock.makefile("rb")
+        line = stream.readline()
+        sock.close()
+        if not line:
+            return None
+        return json.loads(line.decode("utf-8"))
+    except Exception as exc:
+        emit({"t": "error", "message": "ipc: " + str(exc)})
+        return None
+
+
+def nearcast_rpc(payload, timeout=15):
+    """Send one request to nearcastd and read one response line."""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(NEARCAST_SOCKET)
+        sock.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode())
+        stream = sock.makefile("rb")
+        line = stream.readline()
+        sock.close()
+        if not line:
+            return None
+        return json.loads(line.decode("utf-8"))
+    except Exception as exc:
+        emit({"t": "error", "message": "nearcast: " + str(exc)})
+        return None
+
+
+def nearcast_files(entries):
+    return [str(f.get("name", "")) for f in entries or [] if f.get("name")]
+
+
+def nearcast_event(msg):
+    """Map a nearcastd event into the plugin's stable event schema."""
+    kind = msg.get("type")
+    if kind == "device_found":
+        device = msg.get("device", {})
+        route = device.get("route", {})
+        emit(
+            {
+                "t": "device",
+                "id": device.get("id", ""),
+                "name": device.get("name", ""),
+                "kind": device.get("device_type", ""),
+                "addr": str(route.get("addr", "")),
+            }
+        )
+    elif kind == "device_lost":
+        emit({"t": "gone", "id": msg.get("id", "")})
+    elif kind == "transfer":
+        tr = msg.get("transfer", {})
+        state = tr.get("state")
+        transfer_id = tr.get("id", "")
+        sender = tr.get("peer", "")
+        files = nearcast_files(tr.get("files"))
+        if state == "awaiting_decision":
+            emit(
+                {
+                    "t": "ask",
+                    "id": transfer_id,
+                    "from": sender,
+                    "pin": tr.get("pin") or "",
+                    "files": files,
+                    "bytes": tr.get("bytes_total", 0),
+                }
+            )
+        elif state == "transferring":
+            emit(
+                {
+                    "t": "progress",
+                    "id": transfer_id,
+                    "done": tr.get("bytes_done", 0),
+                    "total": tr.get("bytes_total", 0),
+                }
+            )
+        elif state == "finished":
+            emit(
+                {
+                    "t": "received",
+                    "id": transfer_id,
+                    "from": sender,
+                    "files": files,
+                    "dir": ", ".join(tr.get("saved", [])),
+                    "bytes": tr.get("bytes_total", 0),
+                }
+            )
+        elif state in ("rejected", "cancelled", "failed"):
+            emit(
+                {
+                    "t": "result",
+                    "id": transfer_id,
+                    "code": state,
+                    "from": sender,
+                }
+            )
+        elif state in ("connecting", "waiting_for_accept"):
+            emit({"t": "status", "backend": "nearcast", "state": "ready"})
+
+
+def nearcast_stream(command, seconds=None):
+    """Stream events from nearcastd for `command`, optionally for N seconds."""
+    deadline = time.time() + seconds if seconds else None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        if deadline:
+            sock.settimeout(1.0)
+        sock.connect(NEARCAST_SOCKET)
+        sock.sendall((json.dumps(command, separators=(",", ":")) + "\n").encode())
+        stream = sock.makefile("rb")
+        while True:
+            if deadline and time.time() > deadline:
+                break
+            line = stream.readline()
+            if not line:
+                break
+            try:
+                nearcast_event(json.loads(line.decode("utf-8")))
+            except ValueError:
+                pass
+        sock.close()
+    except socket.timeout:
+        pass
+    except Exception as exc:
+        emit({"t": "error", "message": "nearcast stream: " + str(exc)})
+
+
+def serve():
+    os.makedirs(SOCKET_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o600)
+    server.listen(16)
+
+    def handle(conn):
+        stream = None
+        cmd = None
+        handed_off = False
+        request_id = None
+        try:
+            stream = conn.makefile("rwb")
+            raw = stream.readline()
+            if not raw:
+                return
+            msg = json.loads(raw.decode("utf-8"))
+            cmd = msg.get("cmd")
+
+            if cmd == "ask":
+                pin = str(msg.get("pin", ""))
+                sender = str(msg.get("from", ""))
+                request_id = str(
+                    msg.get("id")
+                    or "req-" + hashlib.sha1((sender + "|" + pin).encode()).hexdigest()[:10]
+                )
+                incoming = {
+                    "t": "ask",
+                    "id": request_id,
+                    "from": sender,
+                    "pin": pin,
+                    "files": msg.get("files", []),
+                    "bytes": msg.get("bytes", 0),
+                }
+                with _lock:
+                    _pending[request_id] = (conn, stream)
+                handed_off = True
+                emit(incoming)
+
+                deadline = time.time() + ASK_TIMEOUT
+                while time.time() < deadline:
+                    with _lock:
+                        waiting = request_id in _pending
+                    if not waiting:
+                        break
+                    time.sleep(0.1)
+                else:
+                    with _lock:
+                        entry = _pending.pop(request_id, None)
+                    if entry:
+                        try:
+                            entry[1].write(b'{"accept":false}\n')
+                            entry[1].flush()
+                        except Exception:
+                            pass
+                return
+
+            if cmd in ("accept", "decline"):
+                request_id = str(msg.get("id", ""))
+                if _backend == "quickshare-rx":
+                    ok = False
+                    try:
+                        decision = {
+                            "cmd": "accept" if cmd == "accept" else "decline",
+                            "id": request_id,
+                        }
+                        _backend_stdin.write(json.dumps(decision) + "\n")
+                        _backend_stdin.flush()
+                        ok = True
+                    except Exception as exc:
+                        emit({"t": "error", "message": "decision: " + str(exc)})
+                    stream.write((json.dumps({"ok": ok}) + "\n").encode())
+                    stream.flush()
+                    return
+                if _backend == "nearcastd":
+                    answer = nearcast_rpc({"cmd": "accept" if cmd == "accept" else "reject", "id": request_id})
+                    ok = bool(answer and answer.get("type") in ("ok", "started"))
+                else:
+                    with _lock:
+                        entry = _pending.pop(request_id, None)
+                    ok = False
+                    if entry:
+                        try:
+                            answer = {"accept": cmd == "accept"}
+                            entry[1].write((json.dumps(answer) + "\n").encode())
+                            entry[1].flush()
+                            ok = True
+                        except Exception:
+                            pass
+                stream.write((json.dumps({"ok": ok}) + "\n").encode())
+                stream.flush()
+                return
+
+            if cmd == "ping":
+                stream.write(b'{"ok":true}\n')
+                stream.flush()
+        except Exception as exc:
+            emit({"t": "error", "message": "bridge: " + str(exc)})
+        finally:
+            with _lock:
+                still_waiting = handed_off and request_id in _pending
+            if not still_waiting:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    while True:
+        conn, _ = server.accept()
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+
+def normalize(line):
+    line = line.strip()
+    if not line:
+        return
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        msg = {"t": "log", "message": line}
+    kind = msg.get("t")
+    if kind == "received":
+        emit(msg)
+        append_history(msg)
+    else:
+        emit(msg)
+
+
+def stream_process(proc):
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        normalize(line)
+
+
+def _set_pdeathsig():
+    ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)
+
+
+def spawn(command):
+    global _backend_stdin
+    env = os.environ.copy()
+    env["RUST_LOG"] = env.get("RUST_LOG") or "info,rqs_lib=info"
+    # A fresh name avoids stale Quick Share/Bluetooth cache entries on phones
+    # that have already tried (and failed) to connect to an earlier instance.
+    env["RQS_DEVICE_NAME"] = env.get("RQS_DEVICE_NAME") or "Omarchy Share"
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+        preexec_fn=_set_pdeathsig,
+    )
+    _backend_stdin = proc.stdin
+    return proc
+
+
+def watch():
+    threading.Thread(target=serve, daemon=True).start()
+    name, path = find_backend()
+    if not name:
+        emit(
+            {
+                "t": "status",
+                "backend": None,
+                "state": "missing",
+                "message": "No Quick Share backend found. Run install.sh in the plugin directory.",
+            }
+        )
+        while True:
+            time.sleep(3600)
+
+    emit({"t": "status", "backend": name, "state": "starting"})
+
+    if name == "quickshare-rx":
+        # Working BLE/L2CAP receiver with explicit accept/decline support.
+        command = [path]
+    elif name == "nearcastd":
+        # LAN upgrades work even when the PC is a hotspot client. Wi-Fi Direct
+        # and hotspot upgrades need nearcast-netd as a system service; skip
+        # them unless it has been installed.
+        command = [path, "--name", "Omarchy PC", "--port", "53318", "--upgrade", "lan"]
+    elif name == "quickshare":
+        command = [path, "receive", "--json", "--ask", ASK_SCRIPT]
+    else:
+        command = [path]
+
+    try:
+        proc = spawn(command)
+    except Exception as exc:
+        emit({"t": "status", "backend": name, "state": "error", "message": str(exc)})
+        while True:
+            time.sleep(3600)
+
+    emit({"t": "status", "backend": name, "state": "ready", "pid": proc.pid})
+
+    def read_logs(pipe):
+        if not pipe:
+            return
+        for line in pipe:
+            line = line.strip()
+            if line:
+                emit({"t": "log", "message": line[:500]})
+                try:
+                    with open(os.path.join(STATE_DIR, "backend.log"), "a", encoding="utf-8") as out:
+                        out.write(time.strftime("%H:%M:%S") + " " + line + "\n")
+                except Exception:
+                    pass
+
+    threading.Thread(target=read_logs, args=(proc.stderr,), daemon=True).start()
+
+    if name == "nearcastd":
+        # nearcastd writes tracing output to stdout, so drain that pipe too.
+        threading.Thread(target=read_logs, args=(proc.stdout,), daemon=True).start()
+        # Give the daemon a moment to create its socket, then subscribe.
+        time.sleep(1)
+        threading.Thread(target=nearcast_stream, args=({"cmd": "watch"},), daemon=True).start()
+        while proc.poll() is None:
+            time.sleep(1)
+    else:
+        stream_process(proc)
+
+    emit(
+        {
+            "t": "status",
+            "backend": name,
+            "state": "stopped",
+            "message": "Backend exited with code " + str(proc.returncode),
+        }
+    )
+
+
+def scan():
+    name, _ = find_backend()
+    if name == "quickshare-rx":
+        # This backend discovers continuously over BLE; no explicit scan.
+        emit({"t": "scan-done"})
+        return
+    if name == "nearcastd":
+        nearcast_stream({"cmd": "discover"}, seconds=10)
+        emit({"t": "scan-done"})
+        return
+    if name != "quickshare":
+        emit({"t": "error", "message": "Device scan needs nearcast or quickshare."})
+        return
+    path = shutil.which("quickshare")
+    try:
+        proc = subprocess.run(
+            [path, "browse", "--json", "--timeout", "8"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        for line in proc.stdout.splitlines():
+            normalize(line)
+        emit({"t": "scan-done"})
+    except Exception as exc:
+        emit({"t": "error", "message": "scan: " + str(exc)})
+
+
+def send_files(args):
+    if not args:
+        emit({"t": "error", "message": "send needs a target and at least one file"})
+        return
+    name, _ = find_backend()
+    if name == "quickshare-rx":
+        emit({"t": "error", "message": "Sending is not supported by the receive-only backend."})
+        return
+    if name == "nearcastd":
+        nearcast_stream({"cmd": "send", "to": args[0], "files": args[1:]}, seconds=180)
+        return
+    if name != "quickshare":
+        emit({"t": "error", "message": "Sending needs nearcast or quickshare."})
+        return
+    path = shutil.which("quickshare")
+    try:
+        proc = spawn([path, "send", "--json", "--to", args[0]] + args[1:])
+        stream_process(proc)
+    except Exception as exc:
+        emit({"t": "error", "message": "send: " + str(exc)})
+
+
+def ask():
+    sender = os.environ.get("QUICKSHARE_FROM", "")
+    pin = os.environ.get("QUICKSHARE_PIN", "")
+    files = [x for x in os.environ.get("QUICKSHARE_FILES", "").splitlines() if x]
+    try:
+        size = int(os.environ.get("QUICKSHARE_BYTES", "0"))
+    except ValueError:
+        size = 0
+    request_id = "req-" + hashlib.sha1((sender + "|" + pin).encode()).hexdigest()[:10]
+    answer = ctl_message(
+        {
+            "cmd": "ask",
+            "id": request_id,
+            "from": sender,
+            "pin": pin,
+            "files": files,
+            "bytes": size,
+        }
+    )
+    sys.exit(0 if answer and answer.get("accept") else 1)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        return 2
+    mode = sys.argv[1]
+    if mode == "watch":
+        watch()
+    elif mode == "scan":
+        scan()
+    elif mode == "send":
+        send_files(sys.argv[2:])
+    elif mode == "ask":
+        ask()
+    elif mode == "ctl":
+        action = sys.argv[2] if len(sys.argv) > 2 else "ping"
+        request_id = sys.argv[3] if len(sys.argv) > 3 else ""
+        answer = ctl_message({"cmd": action, "id": request_id})
+        print(json.dumps(answer if answer is not None else {"ok": False}))
+    elif mode == "ping":
+        answer = ctl_message({"cmd": "ping"})
+        print(json.dumps(answer if answer is not None else {"ok": False}))
+    else:
+        print("unknown mode: " + mode, file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    sys.exit(main())

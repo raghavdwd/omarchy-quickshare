@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "async.quickshare",
+  "name": "Quick Share",
+  "version": "0.1.0",
+  "author": "async",
+  "description": "Receive and send files with Android Quick Share from the Omarchy bar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Quick Share",
+    "description": "Android Quick Share status and transfers",
+    "category": "System",
+    "allowMultiple": false
+  }
+}
